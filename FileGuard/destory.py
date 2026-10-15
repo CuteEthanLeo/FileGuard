@@ -5,6 +5,8 @@ FileGuard - 文件永久损坏工具
 
 import os
 
+_CHUNK_SIZE = 1024 * 1024
+
 
 def destory_file(file_path: str, method: str = 'random') -> tuple[bool, str]:
     """
@@ -34,11 +36,17 @@ def destory_file(file_path: str, method: str = 'random') -> tuple[bool, str]:
         with open(file_path, 'r+b') as f:
             for _ in range(passes):
                 f.seek(0)
-                f.write(os.urandom(original_size))
+                remaining = original_size
+                while remaining > 0:
+                    size = min(_CHUNK_SIZE, remaining)
+                    f.write(os.urandom(size))
+                    remaining -= size
                 f.flush()
                 os.fsync(f.fileno())
 
-        return True, f"文件已永久损坏\n文件: {original_name}\n大小: {original_size} 字节\n内容已被随机数据覆盖，无法恢复"
+        return True, (f"文件已永久损坏\n文件: {original_name}\n大小: {original_size} 字节\n"
+                      f"内容已被随机数据覆盖 {passes} 次\n\n"
+                      "提示：SSD、U 盘等闪存设备或开启了云同步/卷影副本时，旧数据可能仍有残留")
 
     except PermissionError:
         return False, "权限不足，无法操作文件"

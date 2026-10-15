@@ -5,7 +5,15 @@ FileGuard - 文件锁定模块
 
 import os
 import ctypes
-import ctypes.wintypes
+import ctypes.wintypes as wintypes
+
+_kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+_kernel32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+                                  wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+_kernel32.CreateFileW.restype = wintypes.HANDLE
+_kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+_kernel32.CloseHandle.restype = wintypes.BOOL
+INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
 
 
 class FileBlocker:
@@ -25,6 +33,7 @@ class FileBlocker:
             if os.path.isdir(file_path):
                 return False, "不支持锁定目录"
 
+            file_path = os.path.normcase(os.path.abspath(file_path))
             if file_path in self.locked_files:
                 return False, "文件已被 FileGuard 锁定"
 
@@ -33,7 +42,7 @@ class FileBlocker:
             GENERIC_WRITE = 0x40000000
             OPEN_EXISTING = 3
 
-            handle = ctypes.windll.kernel32.CreateFileW(
+            handle = _kernel32.CreateFileW(
                 file_path,
                 GENERIC_READ | GENERIC_WRITE,
                 0,  # 禁止任何共享 - 独占锁
@@ -43,8 +52,8 @@ class FileBlocker:
                 None
             )
 
-            if handle == -1 or handle == 0:
-                error_code = ctypes.GetLastError()
+            if handle is None or handle == INVALID_HANDLE_VALUE:
+                error_code = ctypes.get_last_error()
                 if error_code == 5:
                     return False, "权限不足，请以管理员身份运行"
                 elif error_code == 32:
@@ -64,10 +73,12 @@ class FileBlocker:
         """解锁文件"""
         try:
             if file_path not in self.locked_files:
+                file_path = os.path.normcase(os.path.abspath(file_path))
+            if file_path not in self.locked_files:
                 return False, "文件未被 FileGuard 锁定"
 
             handle = self.locked_files[file_path]
-            ctypes.windll.kernel32.CloseHandle(handle)
+            _kernel32.CloseHandle(handle)
 
             del self.locked_files[file_path]
             return True, f"文件已解锁: {os.path.basename(file_path)}"
@@ -85,7 +96,7 @@ class FileBlocker:
         return count > 0, f"已解锁 {count} 个文件"
 
     def is_locked(self, file_path: str) -> bool:
-        return file_path in self.locked_files
+        return os.path.normcase(os.path.abspath(file_path)) in self.locked_files
 
     def get_locked_files(self) -> list:
         return list(self.locked_files.keys())

@@ -1,287 +1,99 @@
 """
 FileGuard - 文件加密工具
 黑白风格，简洁现代化界面
-支持两种加密算法：经典版 (AES-256-CFB) 和 高级版 (AES-256-GCM)
+加密: Argon2id 密钥派生 + 分块 AES-256-GCM 认证加密 (V2 格式)
+解密: 自动识别 V2 格式与 V1.x 旧格式
 """
 
 import sys
 import os
-import random
 from datetime import datetime
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QLabel, QLineEdit,
                              QFileDialog, QMessageBox, QFrame, QTabWidget,
-                             QComboBox, QDialog, QTextEdit)
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QRect
-from PyQt6.QtGui import QFont, QPainter, QColor, QPen, QBrush, QIcon, QAction
+                             QDialog, QTextEdit, QProgressBar, QInputDialog)
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QFileSystemWatcher
+from PyQt6.QtGui import QFont, QIcon, QAction
 
-from lock1 import FileLocker as FileLockerV1
-from lock2 import FileLockerV2
+import core
 from destory import destory_file
 from panic import FileBlocker
 from contextmenu import ContextMenuManager
 from preview import preview
 
+APP_VERSION = "2.0"
+MIN_PASSWORD_LENGTH = 8
 
-class HumanVerification(QWidget):
-    """拼图滑块验证组件"""
-    verified = pyqtSignal(bool)
 
-    def __init__(self):
-        super().__init__()
-        self.dragging = False
-        self.drag_pos = 10
-        self.verified_flag = False
-        self.slider_width = 50
-        self.drag_start = 0
-        self.start_time = 0
-        self.gap_position = random.randint(150, 250)
-        self.init_ui()
+def resource_path(name: str) -> str:
+    """资源文件路径，兼容 PyInstaller 打包后的临时目录"""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, name)
 
-    def init_ui(self):
-        self.setFixedHeight(100)
-        self.setMinimumWidth(400)
-        self.setMouseTracking(True)
 
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-
-        width = self.width()
-        height = self.height()
-
-        track_rect = QRect(10, 40, width - 20, 40)
-        painter.fillRect(track_rect, QBrush(QColor(45, 45, 45)))
-        painter.setPen(QPen(QColor(60, 60, 60), 1))
-        painter.drawRect(track_rect)
-
-        if not self.verified_flag:
-            gap_rect = QRect(self.gap_position, 40, 50, 40)
-            painter.fillRect(gap_rect, QBrush(QColor(80, 80, 80, 100)))
-            painter.setPen(QPen(QColor(100, 100, 100), 1))
-            painter.drawRect(gap_rect)
-            painter.drawText(gap_rect, Qt.AlignmentFlag.AlignCenter, "缺口")
-
-        if not self.verified_flag:
-            slider_x = int(self.drag_pos)
-            if slider_x < 10:
-                slider_x = 10
-            if slider_x > width - self.slider_width - 10:
-                slider_x = width - self.slider_width - 10
-
-            slider_rect = QRect(slider_x, 40, self.slider_width, 40)
-            painter.fillRect(slider_rect, QBrush(QColor(80, 80, 80)))
-            painter.setPen(QPen(QColor(200, 200, 200)))
-            painter.drawText(slider_rect, Qt.AlignmentFlag.AlignCenter, "▶")
-
-        if self.verified_flag:
-            success_rect = QRect(10, 40, width - 20, 40)
-            painter.fillRect(success_rect, QBrush(QColor(40, 167, 69)))
-            painter.setPen(QPen(QColor(255, 255, 255)))
-            painter.drawText(success_rect, Qt.AlignmentFlag.AlignCenter, "✓ 验证通过")
-
-        painter.setPen(QPen(QColor(150, 150, 150)))
-        painter.setFont(QFont("Arial", 9))
-        painter.drawText(10, 30, "→ 按住滑块拖动到右侧缺口位置")
-
-    def mousePressEvent(self, event):
-        if self.verified_flag:
-            return
-        x = int(event.position().x())
-        y = int(event.position().y())
-        slider_x = int(self.drag_pos)
-        if slider_x < 10:
-            slider_x = 10
-        if 10 <= x <= slider_x + self.slider_width and 40 <= y <= 80:
-            self.dragging = True
-            self.drag_start = x
-            self.start_time = event.timestamp()
-
-    def mouseMoveEvent(self, event):
-        if not self.dragging or self.verified_flag:
-            return
-        x = int(event.position().x())
-        delta = x - self.drag_start
-        self.drag_pos = max(10, min(self.width() - self.slider_width - 10, 10 + delta))
-
-        if abs(self.drag_pos - self.gap_position) <= 8:
-            self.verified_flag = True
-            self.dragging = False
-            self.verified.emit(True)
-        self.update()
-
-    def mouseReleaseEvent(self, event):
-        if not self.verified_flag:
-            self.dragging = False
-            self.drag_pos = 10
-            self.update()
-
-    def reset(self):
-        self.dragging = False
-        self.drag_pos = 10
-        self.verified_flag = False
-        self.gap_position = random.randint(150, self.width() - 80)
-        self.update()
+def decrypted_filename(input_path: str) -> str:
+    base_name = os.path.basename(input_path)
+    if base_name.lower().endswith('.enc'):
+        base_name = base_name[:-4]
+    name_without_ext, ext = os.path.splitext(base_name)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"{name_without_ext}_{timestamp}{ext}"
 
 
 class WorkerThread(QThread):
-    finished = pyqtSignal(bool, str)
-    verify_result = pyqtSignal(bool, str)
+    progress = pyqtSignal(int)
+    finished = pyqtSignal(bool, str, bool)  # 成功, 消息, 是否旧格式
 
-    def __init__(self, locker, mode, input_file, output_file, password, verify_only=False):
+    def __init__(self, mode, input_file, output_file, password):
         super().__init__()
-        self.locker = locker
         self.mode = mode
         self.input_file = input_file
         self.output_file = output_file
         self.password = password
-        self.verify_only = verify_only
+
+    def on_progress(self, done, total):
+        self.progress.emit(int(done * 100 / total) if total else 100)
 
     def run(self):
-        if self.verify_only:
-            success, msg = self.locker.verify_password(self.input_file, self.password)
-            self.verify_result.emit(success, msg)
-        elif self.mode == 'encrypt':
-            success, msg = self.locker.encrypt_file(self.input_file, self.output_file, self.password)
-            self.finished.emit(success, msg)
-        else:
-            success, msg = self.locker.decrypt_file(self.input_file, self.output_file, self.password)
-            self.finished.emit(success, msg)
+        try:
+            if self.mode == 'encrypt':
+                core.encrypt(self.input_file, self.output_file, self.password, self.on_progress)
+                self.finished.emit(True, f"加密成功！\n输出文件: {self.output_file}", False)
+            else:
+                fmt, is_legacy = core.decrypt(self.input_file, self.output_file, self.password,
+                                              self.on_progress)
+                self.finished.emit(True, f"解密成功！\n格式: {fmt}\n输出文件: {self.output_file}",
+                                   is_legacy)
+        except core.FileGuardError as e:
+            self.finished.emit(False, str(e), False)
+        except PermissionError:
+            self.finished.emit(False, "权限不足，无法读写文件", False)
+        except Exception as e:
+            self.finished.emit(False, f"操作失败: {e}", False)
 
 
-class CaptchaDialog(QWidget):
-    """验证码弹窗 - 拼图滑块验证"""
-    verified = pyqtSignal(bool)
+def make_progress_bar() -> QProgressBar:
+    bar = QProgressBar()
+    bar.setRange(0, 100)
+    bar.setTextVisible(True)
+    bar.setVisible(False)
+    return bar
 
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("安全验证")
-        self.setFixedSize(400, 320)
-        self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
-        self.setStyleSheet("background-color: #1e1e1e; border: 1px solid #3c3c3c; border-radius: 12px;")
-        self.init_ui()
 
-    def init_ui(self):
-        layout = QVBoxLayout()
-        layout.setSpacing(15)
-        layout.setContentsMargins(25, 25, 25, 25)
-
-        title = QLabel("🔐 安全验证")
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        title.setFont(QFont("Arial", 16, QFont.Weight.Bold))
-        title.setStyleSheet("color: #ffffff;")
-        layout.addWidget(title)
-
-        desc = QLabel("请完成拼图验证，证明您是真实用户")
-        desc.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        desc.setStyleSheet("color: #888888; font-size: 12px;")
-        layout.addWidget(desc)
-
-        layout.addSpacing(10)
-
-        slider_group = QWidget()
-        slider_group.setStyleSheet("background-color: #2a2a2a; border-radius: 8px;")
-        slider_layout = QVBoxLayout()
-        slider_layout.setSpacing(10)
-
-        slider_title = QLabel("拼图验证")
-        slider_title.setStyleSheet("color: #ffffff; font-weight: bold;")
-        slider_layout.addWidget(slider_title)
-
-        self.slider = HumanVerification()
-        slider_layout.addWidget(self.slider)
-
-        slider_group.setLayout(slider_layout)
-        layout.addWidget(slider_group)
-
-        layout.addSpacing(10)
-
-        btn_layout = QHBoxLayout()
-        btn_layout.setSpacing(12)
-
-        self.confirm_btn = QPushButton("✓ 验证")
-        self.confirm_btn.setMinimumHeight(42)
-        self.confirm_btn.clicked.connect(self.verify)
-        self.confirm_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #2d2d2d;
-                color: #ffffff;
-                border: 1px solid #3c3c3c;
-                border-radius: 8px;
-                padding: 10px;
-                font-weight: bold;
-                font-size: 14px;
-            }
-            QPushButton:hover {
-                background-color: #3c3c3c;
-                border: 1px solid #ffffff;
-            }
-        """)
-        btn_layout.addWidget(self.confirm_btn)
-
-        self.cancel_btn = QPushButton("✗ 取消")
-        self.cancel_btn.setMinimumHeight(42)
-        self.cancel_btn.clicked.connect(self.reject)
-        self.cancel_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #2d2d2d;
-                color: #ffffff;
-                border: 1px solid #3c3c3c;
-                border-radius: 8px;
-                padding: 10px;
-                font-weight: bold;
-                font-size: 14px;
-            }
-            QPushButton:hover {
-                background-color: #3c3c3c;
-                border: 1px solid #ffffff;
-            }
-        """)
-        btn_layout.addWidget(self.cancel_btn)
-
-        layout.addLayout(btn_layout)
-
-        self.error_label = QLabel("")
-        self.error_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.error_label.setStyleSheet("color: #ff6b6b; font-size: 11px;")
-        self.error_label.setVisible(False)
-        layout.addWidget(self.error_label)
-
-        self.setLayout(layout)
-
-        self.slider.verified.connect(self.on_slider_verified)
-        self.slider_ok = False
-
-    def on_slider_verified(self, ok):
-        self.slider_ok = ok
-        if ok:
-            self.verify()
-
-    def verify(self):
-        if self.slider_ok:
-            self.verified.emit(True)
-            self.close()
-        else:
-            self.error_label.setText("❌ 请完成拼图验证")
-            self.error_label.setVisible(True)
-            QTimer.singleShot(2000, lambda: self.error_label.setVisible(False))
-
-    def reject(self):
-        self.verified.emit(False)
-        self.close()
-
-    def reset(self):
-        self.slider.reset()
-        self.slider_ok = False
-        self.error_label.setVisible(False)
+def confirm_weak_password(parent, password: str) -> bool:
+    if len(password) >= MIN_PASSWORD_LENGTH:
+        return True
+    reply = QMessageBox.warning(
+        parent, "密码较弱",
+        f"密码少于 {MIN_PASSWORD_LENGTH} 位，容易被暴力猜解。\n确定继续使用这个密码吗？",
+        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        QMessageBox.StandardButton.No)
+    return reply == QMessageBox.StandardButton.Yes
 
 
 class EncryptTab(QWidget):
-    def __init__(self, locker_v1, locker_v2):
+    def __init__(self):
         super().__init__()
-        self.locker_v1 = locker_v1
-        self.locker_v2 = locker_v2
-        self.current_locker = self.locker_v2
         self.worker = None
         self.init_ui()
 
@@ -289,40 +101,14 @@ class EncryptTab(QWidget):
         layout = QVBoxLayout()
         layout.setSpacing(15)
 
-        algo_layout = QHBoxLayout()
-        algo_layout.addWidget(QLabel("加密算法:"))
-        self.algo_combo = QComboBox()
-        self.algo_combo.addItems(["AES-256-GCM 认证加密 (高级版)", "AES-256-CFB 流加密 (经典版)"])
-        self.algo_combo.setStyleSheet("""
-            QComboBox {
-                background-color: #2d2d2d;
-                color: #ffffff;
-                border: 1px solid #3c3c3c;
-                border-radius: 4px;
-                padding: 5px;
-            }
-            QComboBox::drop-down {
-                border: none;
-            }
-            QComboBox QAbstractItemView {
-                background-color: #2d2d2d;
-                color: #ffffff;
-                selection-background-color: #3c3c3c;
-            }
-        """)
-        self.algo_combo.currentIndexChanged.connect(self.on_algo_changed)
-        algo_layout.addWidget(self.algo_combo)
-        algo_layout.addStretch()
-        layout.addLayout(algo_layout)
-
-        self.algo_desc = QLabel("GCM模式自带认证，防篡改，推荐使用")
-        self.algo_desc.setStyleSheet("color: #888888; font-size: 10px;")
-        layout.addWidget(self.algo_desc)
+        algo_desc = QLabel("Argon2id 密钥派生 | AES-256-GCM 分块认证加密 | 防篡改 + 防暴力破解")
+        algo_desc.setStyleSheet("color: #40a743; font-size: 10px;")
+        layout.addWidget(algo_desc)
 
         input_layout = QHBoxLayout()
         input_layout.addWidget(QLabel("源文件:"))
         self.input_file = QLineEdit()
-        self.input_file.setPlaceholderText("选择要加密的文件...")
+        self.input_file.setPlaceholderText("选择或拖入要加密的文件...")
         input_layout.addWidget(self.input_file)
         browse_btn = QPushButton("浏览")
         browse_btn.clicked.connect(self.select_input)
@@ -343,7 +129,7 @@ class EncryptTab(QWidget):
         pwd_layout.addWidget(QLabel("密码:"))
         self.password = QLineEdit()
         self.password.setEchoMode(QLineEdit.EchoMode.Password)
-        self.password.setPlaceholderText("输入加密密码...")
+        self.password.setPlaceholderText(f"输入加密密码（建议不少于 {MIN_PASSWORD_LENGTH} 位）...")
         pwd_layout.addWidget(self.password)
         layout.addLayout(pwd_layout)
 
@@ -357,39 +143,29 @@ class EncryptTab(QWidget):
 
         layout.addStretch()
 
+        self.progress_bar = make_progress_bar()
+        layout.addWidget(self.progress_bar)
+
         self.encrypt_btn = QPushButton("开始加密")
         self.encrypt_btn.setMinimumHeight(45)
-        self.encrypt_btn.clicked.connect(self.show_captcha_and_encrypt)
+        self.encrypt_btn.clicked.connect(self.encrypt)
         layout.addWidget(self.encrypt_btn)
 
         self.setLayout(layout)
 
-    def on_algo_changed(self, index):
-        if index == 0:
-            self.current_locker = self.locker_v2
-            self.algo_desc.setText("AES-256-GCM | 认证加密模式 | 防篡改 + 防暴力破解 | 企业级安全")
-            self.algo_desc.setStyleSheet("color: #40a743; font-size: 10px;")
-        else:
-            self.current_locker = self.locker_v1
-            self.algo_desc.setText("AES-256-CFB | 流加密模式 | 基础安全")
-            self.algo_desc.setStyleSheet("color: #888888; font-size: 10px;")
+    def set_input(self, path):
+        self.input_file.setText(path)
+        self.output_file.setText(path + ".enc")
 
     def select_input(self):
         path, _ = QFileDialog.getOpenFileName(self, "选择要加密的文件")
         if path:
-            self.input_file.setText(path)
-            if not self.output_file.text():
-                self.output_file.setText(path + ".enc")
+            self.set_input(path)
 
     def select_output(self):
         path, _ = QFileDialog.getSaveFileName(self, "保存加密文件", "", "加密文件 (*.enc)")
         if path:
             self.output_file.setText(path)
-
-    def show_captcha_and_encrypt(self):
-        captcha = CaptchaDialog(self.window())
-        captcha.verified.connect(lambda ok: self.encrypt() if ok else None)
-        captcha.show()
 
     def encrypt(self):
         input_path = self.input_file.text().strip()
@@ -397,7 +173,7 @@ class EncryptTab(QWidget):
         password = self.password.text()
         confirm = self.confirm_password.text()
 
-        if not input_path or not os.path.exists(input_path):
+        if not input_path or not os.path.isfile(input_path):
             QMessageBox.critical(self, "错误", "请选择有效的源文件")
             return
 
@@ -413,6 +189,9 @@ class EncryptTab(QWidget):
             QMessageBox.critical(self, "错误", "两次输入的密码不一致")
             return
 
+        if not confirm_weak_password(self, password):
+            return
+
         if os.path.exists(output_path):
             reply = QMessageBox.question(self, "确认", f"文件已存在:\n{output_path}\n是否覆盖？",
                                          QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
@@ -421,14 +200,18 @@ class EncryptTab(QWidget):
 
         self.encrypt_btn.setEnabled(False)
         self.encrypt_btn.setText("加密中...")
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(True)
 
-        self.worker = WorkerThread(self.current_locker, 'encrypt', input_path, output_path, password)
+        self.worker = WorkerThread('encrypt', input_path, output_path, password)
+        self.worker.progress.connect(self.progress_bar.setValue)
         self.worker.finished.connect(self.on_finished)
         self.worker.start()
 
-    def on_finished(self, success, message):
+    def on_finished(self, success, message, _is_legacy):
         self.encrypt_btn.setEnabled(True)
         self.encrypt_btn.setText("开始加密")
+        self.progress_bar.setVisible(False)
 
         if success:
             QMessageBox.information(self, "成功", message)
@@ -441,11 +224,8 @@ class EncryptTab(QWidget):
 
 
 class DecryptTab(QWidget):
-    def __init__(self, locker_v1, locker_v2):
+    def __init__(self):
         super().__init__()
-        self.locker_v1 = locker_v1
-        self.locker_v2 = locker_v2
-        self.current_locker = self.locker_v2
         self.worker = None
         self.init_ui()
 
@@ -453,40 +233,15 @@ class DecryptTab(QWidget):
         layout = QVBoxLayout()
         layout.setSpacing(15)
 
-        algo_layout = QHBoxLayout()
-        algo_layout.addWidget(QLabel("解密算法:"))
-        self.algo_combo = QComboBox()
-        self.algo_combo.addItems(["AES-256-GCM 认证加密 (高级版)", "AES-256-CFB 流加密 (经典版)"])
-        self.algo_combo.setStyleSheet("""
-            QComboBox {
-                background-color: #2d2d2d;
-                color: #ffffff;
-                border: 1px solid #3c3c3c;
-                border-radius: 4px;
-                padding: 5px;
-            }
-            QComboBox::drop-down {
-                border: none;
-            }
-            QComboBox QAbstractItemView {
-                background-color: #2d2d2d;
-                color: #ffffff;
-                selection-background-color: #3c3c3c;
-            }
-        """)
-        self.algo_combo.currentIndexChanged.connect(self.on_algo_changed)
-        algo_layout.addWidget(self.algo_combo)
-        algo_layout.addStretch()
-        layout.addLayout(algo_layout)
-
-        self.algo_desc = QLabel("GCM模式自带认证，防篡改，推荐用于新文件")
-        self.algo_desc.setStyleSheet("color: #888888; font-size: 10px;")
-        layout.addWidget(self.algo_desc)
+        self.format_label = QLabel("自动识别加密格式（支持 V2.0 与 V1.x 旧版文件）")
+        self.format_label.setStyleSheet("color: #888888; font-size: 10px;")
+        layout.addWidget(self.format_label)
 
         input_layout = QHBoxLayout()
         input_layout.addWidget(QLabel("加密文件:"))
         self.input_file = QLineEdit()
-        self.input_file.setPlaceholderText("选择要解密的文件...")
+        self.input_file.setPlaceholderText("选择或拖入要解密的文件...")
+        self.input_file.editingFinished.connect(self.on_input_changed)
         input_layout.addWidget(self.input_file)
         browse_btn = QPushButton("浏览")
         browse_btn.clicked.connect(self.select_input)
@@ -521,28 +276,26 @@ class DecryptTab(QWidget):
 
         layout.addStretch()
 
+        self.progress_bar = make_progress_bar()
+        layout.addWidget(self.progress_bar)
+
         self.decrypt_btn = QPushButton("开始解密")
         self.decrypt_btn.setMinimumHeight(45)
-        self.decrypt_btn.clicked.connect(self.show_captcha_and_decrypt)
+        self.decrypt_btn.clicked.connect(self.decrypt)
         layout.addWidget(self.decrypt_btn)
 
         self.setLayout(layout)
 
-    def on_algo_changed(self, index):
-        if index == 0:
-            self.current_locker = self.locker_v2
-            self.algo_desc.setText("GCM模式自带认证，防篡改，推荐用于新加密的文件")
-            self.algo_desc.setStyleSheet("color: #40a743; font-size: 10px;")
-        else:
-            self.current_locker = self.locker_v1
-            self.algo_desc.setText("CFB模式，经典稳定，用于旧版加密的文件")
-            self.algo_desc.setStyleSheet("color: #888888; font-size: 10px;")
+    def set_input(self, path):
+        self.input_file.setText(path)
+        if not self.output_dir.text().strip():
+            self.output_dir.setText(os.path.dirname(os.path.abspath(path)))
+        self.on_input_changed()
 
     def select_input(self):
         path, _ = QFileDialog.getOpenFileName(self, "选择要解密的文件", "", "加密文件 (*.enc);;所有文件 (*.*)")
         if path:
-            self.input_file.setText(path)
-            self.update_filename_preview()
+            self.set_input(path)
 
     def select_output_dir(self):
         path = QFileDialog.getExistingDirectory(self, "选择输出目录")
@@ -550,33 +303,29 @@ class DecryptTab(QWidget):
             self.output_dir.setText(path)
             self.update_filename_preview()
 
+    def on_input_changed(self):
+        input_path = self.input_file.text().strip()
+        if os.path.isfile(input_path):
+            fmt = core.detect_format(input_path).splitlines()[0]
+            self.format_label.setText(f"已识别 → {fmt}")
+            self.format_label.setStyleSheet("color: #40a743; font-size: 10px;")
+        self.update_filename_preview()
+
     def update_filename_preview(self):
         input_path = self.input_file.text().strip()
         if input_path:
-            base_name = os.path.basename(input_path)
-            if base_name.endswith('.enc'):
-                base_name = base_name[:-4]
-
-            name_without_ext, ext = os.path.splitext(base_name)
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            preview_name = f"{name_without_ext}_{timestamp}{ext}"
-            self.filename_preview.setText(preview_name)
-
-    def show_captcha_and_decrypt(self):
-        captcha = CaptchaDialog(self.window())
-        captcha.verified.connect(lambda ok: self.decrypt() if ok else None)
-        captcha.show()
+            self.filename_preview.setText(decrypted_filename(input_path))
 
     def decrypt(self):
         input_path = self.input_file.text().strip()
         output_dir = self.output_dir.text().strip()
         password = self.password.text()
 
-        if not input_path or not os.path.exists(input_path):
+        if not input_path or not os.path.isfile(input_path):
             QMessageBox.critical(self, "错误", "请选择有效的加密文件")
             return
 
-        if not output_dir or not os.path.exists(output_dir):
+        if not output_dir or not os.path.isdir(output_dir):
             QMessageBox.critical(self, "错误", "请选择有效的输出目录")
             return
 
@@ -584,44 +333,36 @@ class DecryptTab(QWidget):
             QMessageBox.critical(self, "错误", "请输入密码")
             return
 
-        base_name = os.path.basename(input_path)
-        if base_name.endswith('.enc'):
-            base_name = base_name[:-4]
-
-        name_without_ext, ext = os.path.splitext(base_name)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_filename = f"{name_without_ext}_{timestamp}{ext}"
-        output_path = os.path.join(output_dir, output_filename)
+        output_path = os.path.join(output_dir, decrypted_filename(input_path))
 
         self.decrypt_btn.setEnabled(False)
-        self.decrypt_btn.setText("验证密码中...")
-
-        self.worker = WorkerThread(self.current_locker, '', input_path, '', password, verify_only=True)
-        self.worker.verify_result.connect(lambda success, msg: self.on_verify_finished(success, msg, output_path))
-        self.worker.start()
-
-    def on_verify_finished(self, success, msg, output_path):
-        if not success:
-            self.decrypt_btn.setEnabled(True)
-            self.decrypt_btn.setText("开始解密")
-            QMessageBox.critical(self, "密码错误", f"密码不正确，无法解密\n\n提示：请确认选择了正确的解密算法")
-            return
-
         self.decrypt_btn.setText("解密中...")
-        self.worker = WorkerThread(self.current_locker, 'decrypt', self.input_file.text().strip(), output_path, self.password.text())
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(True)
+
+        self.worker = WorkerThread('decrypt', input_path, output_path, password)
+        self.worker.progress.connect(self.progress_bar.setValue)
         self.worker.finished.connect(self.on_decrypt_finished)
         self.worker.start()
 
-    def on_decrypt_finished(self, success, message):
+    def on_decrypt_finished(self, success, message, is_legacy):
         self.decrypt_btn.setEnabled(True)
         self.decrypt_btn.setText("开始解密")
+        self.progress_bar.setVisible(False)
 
         if success:
-            QMessageBox.information(self, "成功", f"解密成功！\n{message}")
+            if is_legacy:
+                message += ("\n\n⚠️ 该文件使用 V1.x 旧版格式，存在安全缺陷。\n"
+                            "建议用 FileGuard 2.0 重新加密解密后的文件，并删除旧的加密文件。")
+                QMessageBox.warning(self, "解密成功（旧版格式）", message)
+            else:
+                QMessageBox.information(self, "成功", message)
             self.input_file.clear()
             self.output_dir.clear()
             self.filename_preview.clear()
             self.password.clear()
+            self.format_label.setText("自动识别加密格式（支持 V2.0 与 V1.x 旧版文件）")
+            self.format_label.setStyleSheet("color: #888888; font-size: 10px;")
         else:
             QMessageBox.critical(self, "失败", message)
 
@@ -629,15 +370,15 @@ class DecryptTab(QWidget):
 class FileGuardUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.locker_v1 = FileLockerV1()
-        self.locker_v2 = FileLockerV2()
         self.file_blocker = FileBlocker()
+        self.context_menu = ContextMenuManager()
         self.init_ui()
         self.apply_style()
-        self.setWindowIcon(QIcon("app.ico"))
+        self.setWindowIcon(QIcon(resource_path("app.ico")))
+        self.setAcceptDrops(True)
 
     def init_ui(self):
-        self.setWindowTitle("FileGuard")
+        self.setWindowTitle(f"FileGuard V{APP_VERSION}")
         self.setGeometry(100, 100, 750, 600)
 
         menubar = self.menuBar()
@@ -686,7 +427,7 @@ class FileGuardUI(QMainWindow):
         settings_menu = menubar.addMenu("设置")
         self.context_menu_action = QAction("右键菜单 (FileGuard 加密/解密)", self)
         self.context_menu_action.setCheckable(True)
-        self.context_menu_action.setChecked(self.check_context_menu_installed())
+        self.context_menu_action.setChecked(self.context_menu.is_installed())
         self.context_menu_action.triggered.connect(self.toggle_context_menu)
         settings_menu.addAction(self.context_menu_action)
 
@@ -700,7 +441,7 @@ class FileGuardUI(QMainWindow):
         title.setFont(QFont("Arial", 20, QFont.Weight.Bold))
         layout.addWidget(title)
 
-        subtitle = QLabel("AES-256-GCM 认证加密 | AES-256-CFB 流加密 | 企业级安全验证")
+        subtitle = QLabel(f"V{APP_VERSION} | Argon2id + AES-256-GCM 认证加密 | 拖入文件即可开始")
         subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
         subtitle.setFont(QFont("Arial", 10))
         layout.addWidget(subtitle)
@@ -709,12 +450,36 @@ class FileGuardUI(QMainWindow):
         sep.setFrameShape(QFrame.Shape.HLine)
         layout.addWidget(sep)
 
+        self.encrypt_tab = EncryptTab()
+        self.decrypt_tab = DecryptTab()
         self.tabs = QTabWidget()
-        self.tabs.addTab(EncryptTab(self.locker_v1, self.locker_v2), "加密")
-        self.tabs.addTab(DecryptTab(self.locker_v1, self.locker_v2), "解密")
+        self.tabs.addTab(self.encrypt_tab, "加密")
+        self.tabs.addTab(self.decrypt_tab, "解密")
         layout.addWidget(self.tabs)
 
         central.setLayout(layout)
+
+    def open_file(self, path, mode=None):
+        """把文件填入加密/解密页; mode 为空时按扩展名判断"""
+        if mode is None:
+            mode = 'decrypt' if path.lower().endswith('.enc') else 'encrypt'
+        if mode == 'encrypt':
+            self.tabs.setCurrentWidget(self.encrypt_tab)
+            self.encrypt_tab.set_input(path)
+        else:
+            self.tabs.setCurrentWidget(self.decrypt_tab)
+            self.decrypt_tab.set_input(path)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        for url in event.mimeData().urls():
+            path = url.toLocalFile()
+            if os.path.isfile(path):
+                self.open_file(path)
+                break
 
     def open_preview_window(self):
         file_path, _ = QFileDialog.getOpenFileName(self, "选择要预览的文件", "", "所有文件 (*.*)")
@@ -734,8 +499,7 @@ class FileGuardUI(QMainWindow):
 
         def load_preview():
             try:
-                text = preview(file_path)
-                text_edit.setPlainText(text)
+                text_edit.setPlainText(preview(file_path))
             except Exception as e:
                 text_edit.setPlainText(f"读取失败: {str(e)}")
 
@@ -743,12 +507,9 @@ class FileGuardUI(QMainWindow):
         layout.addWidget(text_edit)
 
         # 文件监听器（自动刷新）
-        from PyQt6.QtCore import QFileSystemWatcher
-        watcher = QFileSystemWatcher()
-        watcher.addPath(file_path)
+        watcher = QFileSystemWatcher([file_path], dialog)
         watcher.fileChanged.connect(load_preview)
 
-        # 按钮
         btn_layout = QHBoxLayout()
         refresh_btn = QPushButton("手动刷新")
         refresh_btn.clicked.connect(load_preview)
@@ -758,34 +519,23 @@ class FileGuardUI(QMainWindow):
         btn_layout.addWidget(close_btn)
         layout.addLayout(btn_layout)
 
-        # 状态提示
         status_label = QLabel("✓ 自动监听文件变化，修改后自动刷新")
         status_label.setStyleSheet("color: #888888; font-size: 10px;")
         layout.addWidget(status_label)
 
-        def on_dialog_close():
-            watcher.fileChanged.disconnect()
-            dialog.close()
-
-        close_btn.clicked.disconnect()
-        close_btn.clicked.connect(on_dialog_close)
-
         dialog.exec()
+
     def destroy_file(self):
         file_path, _ = QFileDialog.getOpenFileName(self, "选择要永久损坏的文件", "", "所有文件 (*.*)")
         if not file_path:
             return
 
         reply = QMessageBox.warning(self, "⚠️ 危险操作", f"确定永久损坏 {file_path}？\n\n此操作不可逆！",
-                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                     QMessageBox.StandardButton.No)
         if reply != QMessageBox.StandardButton.Yes:
             return
 
-        captcha = CaptchaDialog(self)
-        captcha.verified.connect(lambda ok: self.do_destroy(file_path) if ok else None)
-        captcha.show()
-
-    def do_destroy(self, file_path):
         success, msg = destory_file(file_path, method='random')
         if success:
             QMessageBox.information(self, "成功", msg)
@@ -799,14 +549,9 @@ class FileGuardUI(QMainWindow):
         if self.file_blocker.is_locked(file_path):
             QMessageBox.warning(self, "提示", "文件已被锁定")
             return
-        captcha = CaptchaDialog(self)
-        captcha.verified.connect(lambda ok: self.do_lock_file(file_path) if ok else None)
-        captcha.show()
-
-    def do_lock_file(self, file_path):
         success, msg = self.file_blocker.lock_file(file_path)
         if success:
-            QMessageBox.information(self, "成功", msg)
+            QMessageBox.information(self, "成功", msg + "\n\nFileGuard 运行期间其他程序无法打开该文件，退出时自动解锁")
         else:
             QMessageBox.critical(self, "失败", msg)
 
@@ -815,7 +560,6 @@ class FileGuardUI(QMainWindow):
         if not locked_files:
             QMessageBox.information(self, "提示", "没有已锁定的文件")
             return
-        from PyQt6.QtWidgets import QInputDialog
         file_path, ok = QInputDialog.getItem(self, "解锁文件", "选择要解锁的文件:", locked_files, 0, False)
         if ok and file_path:
             success, msg = self.file_blocker.unlock_file(file_path)
@@ -835,39 +579,20 @@ class FileGuardUI(QMainWindow):
             success, msg = self.file_blocker.unlock_all()
             QMessageBox.information(self, "完成", msg)
 
-    def check_context_menu_installed(self) -> bool:
-        try:
-            import winreg
-            winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, r"*\shell\FileGuardEncrypt")
-            return True
-        except:
-            return False
-
     def toggle_context_menu(self):
         if self.context_menu_action.isChecked():
-            self.install_context_menu()
+            success, msg = self.context_menu.install()
         else:
-            self.uninstall_context_menu()
-
-    def install_context_menu(self):
-        manager = ContextMenuManager()
-        success, msg = manager.install()
+            success, msg = self.context_menu.uninstall()
         if success:
             QMessageBox.information(self, "成功", msg)
-            self.context_menu_action.setChecked(True)
         else:
             QMessageBox.critical(self, "失败", msg)
-            self.context_menu_action.setChecked(False)
+        self.context_menu_action.setChecked(self.context_menu.is_installed())
 
-    def uninstall_context_menu(self):
-        manager = ContextMenuManager()
-        success, msg = manager.uninstall()
-        if success:
-            QMessageBox.information(self, "成功", msg)
-            self.context_menu_action.setChecked(False)
-        else:
-            QMessageBox.critical(self, "失败", msg)
-            self.context_menu_action.setChecked(True)
+    def closeEvent(self, event):
+        self.file_blocker.unlock_all()
+        super().closeEvent(event)
 
     def apply_style(self):
         self.setStyleSheet("""
@@ -903,6 +628,21 @@ class FileGuardUI(QMainWindow):
                 background-color: #3c3c3c;
                 border: 1px solid #ffffff;
             }
+            QPushButton:disabled {
+                color: #777777;
+            }
+            QProgressBar {
+                background-color: #2d2d2d;
+                color: #ffffff;
+                border: 1px solid #3c3c3c;
+                border-radius: 4px;
+                text-align: center;
+                height: 18px;
+            }
+            QProgressBar::chunk {
+                background-color: #40a743;
+                border-radius: 3px;
+            }
             QTabWidget::pane {
                 background-color: #1e1e1e;
                 border: 1px solid #3c3c3c;
@@ -923,23 +663,14 @@ class FileGuardUI(QMainWindow):
 
 
 def main():
-    if len(sys.argv) > 2 and sys.argv[1] in ['--encrypt', '--decrypt']:
-        file_path = sys.argv[2]
-        app = QApplication(sys.argv)
-        window = FileGuardUI()
-        window.show()
-        if sys.argv[1] == '--encrypt':
-            window.tabs.setCurrentIndex(0)
-            window.tabs.currentWidget().input_file.setText(file_path)
-        else:
-            window.tabs.setCurrentIndex(1)
-            window.tabs.currentWidget().input_file.setText(file_path)
-        sys.exit(app.exec())
-
     app = QApplication(sys.argv)
-    app.setWindowIcon(QIcon("app.ico"))
+    app.setWindowIcon(QIcon(resource_path("app.ico")))
     window = FileGuardUI()
     window.show()
+
+    if len(sys.argv) > 2 and sys.argv[1] in ('--encrypt', '--decrypt'):
+        window.open_file(sys.argv[2], 'encrypt' if sys.argv[1] == '--encrypt' else 'decrypt')
+
     sys.exit(app.exec())
 
 
