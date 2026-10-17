@@ -21,7 +21,7 @@ from panic import FileBlocker
 from contextmenu import ContextMenuManager
 from preview import preview
 
-APP_VERSION = "2.0"
+APP_VERSION = "2.0.1"
 MIN_PASSWORD_LENGTH = 8
 
 

@@ -2,7 +2,7 @@
 
 FileGuard 是一个简单、免费、开源的 Windows 文件加密工具，可以加密任意类型的文件。
 
-**当前版本：V2.0** · [下载最新版](https://github.com/CuteEthanLeo/FileGuard/releases/latest)
+**当前版本：V2.0.1** · [下载最新版](https://github.com/CuteEthanLeo/FileGuard/releases/latest)
 
 > ## ⚠️ V1.x 用户安全公告
 > V1.0 ~ V1.4 的加密格式存在严重缺陷：
@@ -24,7 +24,7 @@ FileGuard 是一个简单、免费、开源的 Windows 文件加密工具，可�
 
 ## 使用
 
-1. 从 [Releases](https://github.com/CuteEthanLeo/FileGuard/releases/latest) 下载 `FileGuardV2.0.exe`，双击运行（免安装）。
+1. 从 [Releases](https://github.com/CuteEthanLeo/FileGuard/releases/latest) 下载 `FileGuardV2.0.1.exe`，双击运行（免安装）。
 2. **加密**：选择或拖入文件 → 输入两次密码 → 开始加密，生成 `原文件名.enc`。
 3. **解密**：选择 `.enc` 文件 → 选择输出目录 → 输入密码 → 开始解密，生成 `原文件名_时间戳.扩展名`。
 4. 「设置 → 右键菜单」可开启资源管理器右键菜单（Windows 11 在「显示更多选项」中）。
