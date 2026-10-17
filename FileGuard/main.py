@@ -50,8 +50,15 @@ class WorkerThread(QThread):
         self.input_file = input_file
         self.output_file = output_file
         self.password = password
+        self._cancelled = False
+
+    def cancel(self):
+        """请求中止; 在下一个分块处生效 (密钥派生阶段无法中断, 最多等待约 1 秒)"""
+        self._cancelled = True
 
     def on_progress(self, done, total):
+        if self._cancelled:
+            raise core.OperationCancelled()
         self.progress.emit(int(done * 100 / total) if total else 100)
 
     def run(self):
@@ -64,6 +71,8 @@ class WorkerThread(QThread):
                                               self.on_progress)
                 self.finished.emit(True, f"解密成功！\n格式: {fmt}\n输出文件: {self.output_file}",
                                    is_legacy)
+        except core.OperationCancelled:
+            self.finished.emit(False, "操作已取消", False)
         except core.FileGuardError as e:
             self.finished.emit(False, str(e), False)
         except PermissionError:
@@ -590,7 +599,32 @@ class FileGuardUI(QMainWindow):
             QMessageBox.critical(self, "失败", msg)
         self.context_menu_action.setChecked(self.context_menu.is_installed())
 
+    def running_workers(self) -> list:
+        return [tab.worker for tab in (self.encrypt_tab, self.decrypt_tab)
+                if tab.worker is not None and tab.worker.isRunning()]
+
     def closeEvent(self, event):
+        workers = self.running_workers()
+        if workers:
+            reply = QMessageBox.question(
+                self, "任务进行中",
+                "正在加密/解密，退出将中止当前任务（不会生成输出文件）。\n确定要退出吗？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if reply != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+            for worker in workers:
+                # 断开信号, 避免窗口关闭过程中再弹出"操作已取消"的提示
+                for signal in (worker.progress, worker.finished):
+                    try:
+                        signal.disconnect()
+                    except TypeError:  # 没有已连接的槽
+                        pass
+                worker.cancel()
+            for worker in workers:
+                # 等待线程退出, 让加解密函数删除临时文件; 否则 QThread 被销毁时程序会崩溃
+                worker.wait()
         self.file_blocker.unlock_all()
         super().closeEvent(event)
 

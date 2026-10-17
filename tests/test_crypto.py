@@ -2,6 +2,8 @@
 
 import os
 import sys
+import time
+import struct
 import hashlib
 import tempfile
 import unittest
@@ -130,6 +132,75 @@ class CryptoTest(unittest.TestCase):
         with self.assertRaises(FileGuardError):
             core.encrypt(src, src, PASSWORD)
         self.assertEqual(self.read("a.bin"), b"data")
+
+    def patch_header(self, name, fmt, offset, value):
+        data = bytearray(self.read(name))
+        struct.pack_into(fmt, data, offset, value)
+        self.write(name, bytes(data))
+
+    def assert_rejected_quickly(self, name):
+        start = time.monotonic()
+        with self.assertRaises(FileGuardError) as ctx:
+            core.decrypt(self.path(name), self.path("a.out"), PASSWORD)
+        self.assertIn("超出安全范围", str(ctx.exception))
+        self.assertLess(time.monotonic() - start, 2)
+        self.assertFalse(os.path.exists(self.path("a.out")))
+
+    def test_default_kdf_params_accepted(self):
+        crypto_v2.check_kdf_params(crypto_v2.KDF_ARGON2ID, crypto_v2.ARGON2_MEMORY_KIB,
+                                   crypto_v2.ARGON2_ITERATIONS, crypto_v2.ARGON2_LANES)
+        crypto_v2.check_kdf_params(crypto_v2.KDF_SCRYPT, crypto_v2.SCRYPT_LOG2_N,
+                                   crypto_v2.SCRYPT_R, crypto_v2.SCRYPT_P)
+
+    def test_out_of_range_kdf_params_rejected(self):
+        bad = [
+            (crypto_v2.KDF_ARGON2ID, 0xFFFFFFFF, 3, 4),        # 内存约 4 TiB
+            (crypto_v2.KDF_ARGON2ID, 64 * 1024, 0xFFFFFFFF, 4),  # 迭代 40 亿次
+            (crypto_v2.KDF_ARGON2ID, 64 * 1024, 0, 4),
+            (crypto_v2.KDF_ARGON2ID, 64 * 1024, 3, 0),
+            (crypto_v2.KDF_ARGON2ID, 64 * 1024, 3, 255),
+            (crypto_v2.KDF_ARGON2ID, 8, 3, 4),                   # 内存 < 8 * lanes
+            (crypto_v2.KDF_SCRYPT, 255, 8, 1),                   # N = 2^255
+            (crypto_v2.KDF_SCRYPT, 20, 32, 1),                   # 128 * r * N 超过 1 GiB
+            (crypto_v2.KDF_SCRYPT, 17, 8, 0),
+            (crypto_v2.KDF_SCRYPT, 5, 8, 1),
+        ]
+        for params in bad:
+            with self.subTest(params=params), self.assertRaises(FileGuardError):
+                crypto_v2.check_kdf_params(*params)
+
+    def test_malicious_memory_cost_rejected_before_kdf(self):
+        src = self.write("a.bin", b"data")
+        core.encrypt(src, self.path("a.enc"), PASSWORD)
+        self.patch_header("a.enc", ">I", 6, 0xFFFFFFFF)  # kdf_p1
+        self.assert_rejected_quickly("a.enc")
+
+    def test_malicious_iterations_rejected_before_kdf(self):
+        src = self.write("a.bin", b"data")
+        core.encrypt(src, self.path("a.enc"), PASSWORD)
+        self.patch_header("a.enc", ">I", 10, 0xFFFFFFFF)  # kdf_p2
+        self.assert_rejected_quickly("a.enc")
+
+    def test_cancel_via_progress_leaves_no_output(self):
+        def cancel(done, total):
+            raise core.OperationCancelled()
+
+        src = self.write("a.bin", os.urandom(20000))
+        with self.assertRaises(core.OperationCancelled):
+            crypto_v2.encrypt_file(src, self.path("a.enc"), PASSWORD, progress=cancel, chunk_size=4096)
+        self.assertFalse(os.path.exists(self.path("a.enc")))
+
+        crypto_v2.encrypt_file(src, self.path("a.enc"), PASSWORD, chunk_size=4096)
+        with self.assertRaises(core.OperationCancelled):
+            core.decrypt(self.path("a.enc"), self.path("a.out"), PASSWORD, progress=cancel)
+        self.assertFalse(os.path.exists(self.path("a.out")))
+
+        self.write("old.enc", legacy_cfb_encrypt(os.urandom(50000), PASSWORD))
+        with self.assertRaises(core.OperationCancelled):
+            core.decrypt(self.path("old.enc"), self.path("old.out"), PASSWORD, progress=cancel)
+        self.assertFalse(os.path.exists(self.path("old.out")))
+
+        self.assertEqual([n for n in os.listdir(self.dir) if n.endswith(".tmp")], [])
 
     def test_legacy_cfb(self):
         data = os.urandom(50000)

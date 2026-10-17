@@ -46,6 +46,16 @@ SCRYPT_LOG2_N = 17
 SCRYPT_R = 8
 SCRYPT_P = 1
 
+# 解密时允许的 KDF 参数范围。头部要在密钥派生之后才能被 GCM 认证,
+# 所以必须先做范围检查, 否则恶意文件可写入超大参数耗尽内存或让程序长时间卡死。
+MAX_KDF_MEMORY_BYTES = 1024 * 1024 * 1024  # 1 GiB
+ARGON2_MAX_ITERATIONS = 10
+ARGON2_MAX_LANES = 16
+SCRYPT_MIN_LOG2_N = 10
+SCRYPT_MAX_LOG2_N = 20
+SCRYPT_MAX_R = 32
+SCRYPT_MAX_P = 16
+
 _HEADER_STRUCT = struct.Struct(">4sBBIIB16s8sIB")
 HEADER_SIZE = _HEADER_STRUCT.size
 
@@ -61,6 +71,25 @@ def _argon2_available() -> bool:
         return True
     except Exception:
         return False
+
+
+def check_kdf_params(kdf_id: int, p1: int, p2: int, p3: int) -> None:
+    """检查 KDF 参数是否在安全范围内, 超出范围抛出 FileGuardError"""
+    if kdf_id == KDF_ARGON2ID:
+        memory_kib, iterations, lanes = p1, p2, p3
+        ok = (1 <= lanes <= ARGON2_MAX_LANES
+              and 8 * lanes <= memory_kib <= MAX_KDF_MEMORY_BYTES // 1024
+              and 1 <= iterations <= ARGON2_MAX_ITERATIONS)
+    elif kdf_id == KDF_SCRYPT:
+        log2_n, r, p = p1, p2, p3
+        ok = (SCRYPT_MIN_LOG2_N <= log2_n <= SCRYPT_MAX_LOG2_N
+              and 1 <= r <= SCRYPT_MAX_R
+              and 1 <= p <= SCRYPT_MAX_P
+              and 128 * r * (1 << log2_n) <= MAX_KDF_MEMORY_BYTES)
+    else:
+        raise FileGuardError(f"不支持的密钥派生算法: {kdf_id}")
+    if not ok:
+        raise FileGuardError("文件头中的密钥派生参数超出安全范围，文件可能已损坏或被恶意构造")
 
 
 def _derive_key(password: str, kdf_id: int, p1: int, p2: int, p3: int, salt: bytes) -> bytes:
@@ -194,6 +223,7 @@ def decrypt_file(input_path: str, output_path: str, password: str, progress=None
     chunk_size = info["chunk_size"]
     if not 1024 <= chunk_size <= 64 * 1024 * 1024:
         raise FileGuardError("文件头已损坏")
+    check_kdf_params(info["kdf_id"], info["p1"], info["p2"], info["p3"])
 
     header = info["raw"]
     aes = AESGCM(_derive_key(password, info["kdf_id"], info["p1"], info["p2"], info["p3"], info["salt"]))

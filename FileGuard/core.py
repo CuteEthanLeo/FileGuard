@@ -10,6 +10,10 @@ from crypto_v2 import FileGuardError
 FORMAT_V2 = "FileGuard V2 (Argon2id + AES-256-GCM)"
 
 
+class OperationCancelled(Exception):
+    """由 progress 回调抛出以中止加解密; 临时文件会被自动删除, 不会生成输出文件"""
+
+
 def encrypt(input_path: str, output_path: str, password: str, progress=None) -> None:
     crypto_v2.encrypt_file(input_path, output_path, password, progress)
 
@@ -29,4 +33,4 @@ def detect_format(path: str) -> str:
     return "格式: FileGuard V1.x 旧版格式（或非 FileGuard 文件）\n建议解密后用 V2.0 重新加密"
 
 
-__all__ = ["encrypt", "decrypt", "detect_format", "FileGuardError", "FORMAT_V2"]
+__all__ = ["encrypt", "decrypt", "detect_format", "FileGuardError", "OperationCancelled", "FORMAT_V2"]
